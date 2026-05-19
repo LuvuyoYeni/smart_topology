@@ -1,12 +1,7 @@
-"""
-main.py
--------
-Entry point for EvoComm.
-
-Runs the evolutionary algorithm with default parameters, prints
-generation-by-generation progress, then visualises the best topology
-found as a networkx graph alongside the fitness progress curve.
-"""
+import json
+import os
+import random
+from datetime import datetime
 
 import numpy as np
 import networkx as nx
@@ -16,21 +11,14 @@ import matplotlib.gridspec as gridspec
 from evolution_engine import EvolutionEngine
 from topology_genome import TopologyGenome
 from fitness_evaluator import FitnessEvaluator
+from strategic_evolution_fix import ConnectivityEnforcedEvaluator
+
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
 
 
 def visualise_topology(genome: TopologyGenome) -> None:
-    """
-    Draw the best-found communication topology as a networkx graph.
-
-    Nodes represent agents; edges represent permitted communication links.
-    Node colour encodes degree centrality (darker = more connected).
-    Edge labels are omitted for clarity at larger agent counts.
-
-    Parameters
-    ----------
-    genome : TopologyGenome
-        The genome whose adjacency matrix is used to build the graph.
-    """
     G = nx.Graph()
     G.add_nodes_from(range(genome.num_agents))
 
@@ -42,7 +30,6 @@ def visualise_topology(genome: TopologyGenome) -> None:
 
     pos = nx.spring_layout(G, seed=42)
 
-    # Degree-based node colouring
     degrees = dict(G.degree())
     max_deg = max(degrees.values()) if degrees else 1
     node_colours = [degrees[n] / max(max_deg, 1) for n in G.nodes()]
@@ -73,22 +60,8 @@ def visualise_topology(genome: TopologyGenome) -> None:
 def compare_topologies_extended(
     cooperative_genome: TopologyGenome, strategic_genome: TopologyGenome
 ) -> None:
-    """
-    Cross-table comparison: six topologies × three agent modes.
-
-    Rows: Evolved-Coop, Evolved-Strategic, Full, Ring, Star.
-    Columns: Cooperative, Mixed, Strategic agents.
-
-    Parameters
-    ----------
-    cooperative_genome : TopologyGenome
-        Best genome evolved with cooperative agents.
-    strategic_genome : TopologyGenome
-        Best genome evolved with strategic agents.
-    """
     num_agents = cooperative_genome.num_agents
 
-    # -- Baseline topology matrices --
     full_mat = np.ones((num_agents, num_agents), dtype=bool)
     np.fill_diagonal(full_mat, False)
 
@@ -119,7 +92,7 @@ def compare_topologies_extended(
     print()
     print("  " + "-" * (13 + (col_w + 2) * len(modes)))
 
-    all_results: dict[str, dict[str, float]] = {}
+    all_results = {}
     for name, genome in topologies.items():
         all_results[name] = {}
         print(f"  {name:<13}", end="")
@@ -130,14 +103,12 @@ def compare_topologies_extended(
             print(f"  {fitness:>{col_w}.4f}", end="")
         print()
 
-    # --- Summary ---
     print("\n  Key findings:")
     for mode in modes:
         best = max(topologies.keys(), key=lambda t: all_results[t][mode])
         print(f"    {mode.capitalize():<14} best topology: {best} "
               f"({all_results[best][mode]:.4f})")
 
-    # Rank both evolved topologies across all modes
     print()
     for evolved_name in ("Evol-Coop", "Evol-Strat"):
         ranks = {}
@@ -149,22 +120,16 @@ def compare_topologies_extended(
 
 
 def main() -> None:
-    """
-    Run EvoComm end-to-end.
-
-    1. Instantiate EvolutionEngine with default parameters.
-    2. Run the evolutionary loop (progress printed each generation).
-    3. Print the final best fitness score and genome summary.
-    4. Visualise the best topology as a networkx graph.
-    5. Plot the fitness progress curve.
-    """
     print("=" * 60)
     print("  EvoComm — Evolving Multi-Agent Communication Topologies")
     print("=" * 60)
 
-    def run_evolution(agent_mode: str) -> TopologyGenome:
-        """Run one full evolutionary experiment and return the best genome."""
+    def run_evolution(agent_mode: str) -> tuple[TopologyGenome, EvolutionEngine]:
         eng = EvolutionEngine(agent_mode=agent_mode)
+        if agent_mode == "strategic":
+            eng.fitness_evaluator = ConnectivityEnforcedEvaluator(
+                num_trials=5, agent_mode="strategic"
+            )
         print(f"\n  agent_mode       : {agent_mode}")
         print(f"  population_size  : {eng.population_size}")
         print(f"  num_generations  : {eng.num_generations}")
@@ -175,21 +140,20 @@ def main() -> None:
         print(f"\n  Best ({agent_mode}): {best}")
         eng._plot_progress()
         visualise_topology(best)
-        return best
+        return best, eng
 
-    # --- Run 1: evolve under cooperative agents ---
     print("\n" + "=" * 60)
     print("  Run 1 — Evolving topology with cooperative agents")
     print("=" * 60)
-    best_cooperative = run_evolution("cooperative")
+    best_cooperative, eng_coop = run_evolution("cooperative")
+    coop_fitness = best_cooperative.fitness_score
 
-    # --- Run 2: evolve under strategic agents ---
     print("\n" + "=" * 60)
     print("  Run 2 — Evolving topology with strategic agents")
     print("=" * 60)
-    best_strategic = run_evolution("strategic")
+    best_strategic, eng_strat = run_evolution("strategic")
+    strat_fitness = best_strategic.fitness_score
 
-    # --- Structural comparison of the two evolved topologies ---
     print("\n" + "=" * 60)
     print("  Structural comparison of evolved topologies")
     print("=" * 60)
@@ -203,7 +167,6 @@ def main() -> None:
           f"{'yes' if best_cooperative.is_connected() else 'NO':>14}  "
           f"{'yes' if best_strategic.is_connected() else 'NO':>14}")
 
-    # Compute max degree (centrality proxy) for each
     def max_degree(genome: TopologyGenome) -> int:
         return max(int(genome.adjacency_matrix[i].sum())
                    for i in range(genome.num_agents))
@@ -211,11 +174,43 @@ def main() -> None:
     print(f"  {'Max degree (hub?)':<22} {max_degree(best_cooperative):>14}  "
           f"{max_degree(best_strategic):>14}")
 
-    # --- Cross-table comparison using BOTH evolved topologies ---
     print()
     compare_topologies_extended(best_cooperative, best_strategic)
 
+    os.makedirs("results", exist_ok=True)
+    coop_path = "results/evolved_coop.npz"
+    strat_path = "results/evolved_strat.npz"
+    np.savez(coop_path, adjacency_matrix=best_cooperative.adjacency_matrix)
+    np.savez(strat_path, adjacency_matrix=best_strategic.adjacency_matrix)
 
-# ── Standalone test (also serves as the project entry point) ──────────────────
+    log = {
+        "timestamp": datetime.now().isoformat(),
+        "hyperparameters": {
+            "population_size": eng_coop.population_size,
+            "num_generations": eng_coop.num_generations,
+            "mutation_rate": eng_coop.mutation_rate,
+            "num_agents": eng_coop.num_agents,
+            "seed": SEED,
+        },
+        "results": {
+            "cooperative_best_fitness": coop_fitness,
+            "cooperative_density": best_cooperative.graph_density,
+            "strategic_best_fitness": strat_fitness,
+            "strategic_density": best_strategic.graph_density,
+        },
+        "files": {
+            "evolved_coop": coop_path,
+            "evolved_strat": strat_path,
+        },
+    }
+    log_path = "results/run_log.json"
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+
+    print(f"\n  Saved: {coop_path}")
+    print(f"  Saved: {strat_path}")
+    print(f"  Saved: {log_path}")
+
+
 if __name__ == "__main__":
     main()

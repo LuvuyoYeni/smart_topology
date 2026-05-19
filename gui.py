@@ -1,15 +1,9 @@
-"""
-gui.py
-------
-Primary demonstration interface for EvoComm.
-
-Single-window tkinter application with live fitness chart, topology
-visualisation, baseline comparison, and a contextual about page.
-Evolution runs in a background daemon thread so the UI stays responsive.
-"""
-
 from __future__ import annotations
 
+import math
+import os
+os.environ["TK_SILENCE_DEPRECATION"] = "1"
+import random
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -22,12 +16,12 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import networkx as nx
 import numpy as np
 
+from environment import Environment
 from evolution_engine import EvolutionEngine
 from fitness_evaluator import FitnessEvaluator
 from topology_genome import TopologyGenome
 
 
-# ── Colour palette ────────────────────────────────────────────────────────────
 BG_DARK   = "#1e1e2e"
 BG_PANEL  = "#2a2a3e"
 BG_INPUT  = "#313145"
@@ -38,30 +32,175 @@ GREEN     = "#43a047"
 RED       = "#e53935"
 ORANGE    = "#fb8c00"
 
+_AGENT_COLORS = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
+
+_CELL_SIZE = 60
+_MARGIN    = 20
+_CANVAS_PX = 640
+
+
+def _cell_to_px(r: int, c: int) -> tuple[int, int]:
+    return _MARGIN + c * _CELL_SIZE + _CELL_SIZE // 2, \
+           _MARGIN + r * _CELL_SIZE + _CELL_SIZE // 2
+
+
+def _dim_color(hex_color: str, factor: float) -> str:
+    r = min(int(int(hex_color[1:3], 16) * factor), 255)
+    g = min(int(int(hex_color[3:5], 16) * factor), 255)
+    b = min(int(int(hex_color[5:7], 16) * factor), 255)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+class LiveSimulationRunner:
+
+    GRID_SIZE  = 10
+    NUM_TASKS  = 8
+    TASK_REQ   = 3
+    NUM_AGENTS = 6
+
+    def __init__(self) -> None:
+        self.num_agents: int = self.NUM_AGENTS
+        self.agent_mode: str = "cooperative"
+        self.env: Environment | None = None
+        self.agents: list = []
+        self.comm_graph = None
+        self.topology_genome: TopologyGenome | None = None
+        self.step_count: int = 0
+        self.total_messages: int = 0
+        self.flash_edges: dict[tuple[int, int], int] = {}
+        self.mission_complete: bool = False
+
+    def load_topology(self, name: str) -> str:
+        n = self.NUM_AGENTS
+        if name == "Evolved (demo)":
+            demo_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "results", "demo_genome.npz"
+            )
+            if not os.path.exists(demo_path):
+                return f"File not found:\n{demo_path}\n\nRun main.py first."
+            data = np.load(demo_path)
+            mat = data["adjacency_matrix"].astype(bool)
+            n = mat.shape[0]
+            self.num_agents = n
+            self.topology_genome = TopologyGenome(n, mat)
+        elif name == "Ring":
+            mat = np.zeros((n, n), dtype=bool)
+            for i in range(n):
+                mat[i][(i + 1) % n] = mat[(i + 1) % n][i] = True
+            self.topology_genome = TopologyGenome(n, mat)
+        elif name == "Star":
+            mat = np.zeros((n, n), dtype=bool)
+            for i in range(1, n):
+                mat[0][i] = mat[i][0] = True
+            self.topology_genome = TopologyGenome(n, mat)
+        elif name == "Full":
+            mat = np.ones((n, n), dtype=bool)
+            np.fill_diagonal(mat, False)
+            self.topology_genome = TopologyGenome(n, mat)
+        elif name == "Empty":
+            mat = np.zeros((n, n), dtype=bool)
+            self.topology_genome = TopologyGenome(n, mat)
+        else:
+            return f"Unknown topology: {name!r}"
+        return ""
+
+    def reset(self, seed: int = 42) -> None:
+        np.random.seed(seed)
+        random.seed(seed)
+        self.env = Environment(
+            grid_size=self.GRID_SIZE,
+            num_tasks=self.NUM_TASKS,
+            task_requirement=self.TASK_REQ,
+        )
+        ev = FitnessEvaluator(num_trials=1, agent_mode=self.agent_mode)
+        self.agents = ev._spawn_agents(self.num_agents, self.GRID_SIZE)
+        if self.topology_genome is not None:
+            self.comm_graph = self.topology_genome.to_communication_graph()
+        self.step_count = 0
+        self.total_messages = 0
+        self.flash_edges = {}
+        self.mission_complete = False
+
+    def step(self) -> dict:
+        if self.mission_complete or self.env is None or self.comm_graph is None:
+            return self._state()
+
+        new_flash: dict[tuple[int, int], int] = {}
+
+        for agent in self.agents:
+            agent.perceive(self.env)
+
+        for agent in self.agents:
+            neighbour_ids = self.comm_graph.get_neighbours(agent.agent_id)
+            neighbours = [self.agents[nid] for nid in neighbour_ids]
+            if agent.decide_to_share(agent.private_info) and neighbours:
+                agent.share_all(neighbours)
+                self.total_messages += len(neighbours)
+                for nb in neighbours:
+                    new_flash[(agent.agent_id, nb.agent_id)] = 3
+
+        for agent in self.agents:
+            for msg in agent.inbox:
+                agent.receive_message(msg)
+            agent.inbox.clear()
+
+        for agent in self.agents:
+            agent.act(self.env)
+
+        positions = [agent.position for agent in self.agents]
+        self.env.update(positions)
+
+        active_ids = {t["id"] for t in self.env.get_active_tasks()}
+        for agent in self.agents:
+            stale = [tid for tid in agent.private_info.get("known_tasks", {})
+                     if tid not in active_ids]
+            for tid in stale:
+                del agent.private_info["known_tasks"][tid]
+
+        self.step_count += 1
+
+        for edge, frames in self.flash_edges.items():
+            if edge not in new_flash and frames > 1:
+                new_flash[edge] = frames - 1
+        self.flash_edges = new_flash
+
+        if not self.env.get_active_tasks():
+            self.mission_complete = True
+
+        return self._state()
+
+    def _state(self) -> dict:
+        if self.env is None:
+            return {}
+        tasks_total = len(self.env.tasks)
+        tasks_done  = sum(1 for t in self.env.tasks if t["completed"])
+        adj = (
+            self.topology_genome.adjacency_matrix
+            if self.topology_genome is not None
+            else np.zeros((self.num_agents, self.num_agents), dtype=bool)
+        )
+        return {
+            "positions":        [a.position for a in self.agents],
+            "known_tasks":      [dict(a.private_info.get("known_tasks", {}))
+                                 for a in self.agents],
+            "all_tasks":        list(self.env.tasks),
+            "flash_edges":      dict(self.flash_edges),
+            "total_messages":   self.total_messages,
+            "step_count":       self.step_count,
+            "tasks_done":       tasks_done,
+            "tasks_total":      tasks_total,
+            "mission_complete": self.mission_complete,
+            "adjacency_matrix": adj,
+            "num_agents":       self.num_agents,
+        }
+
 
 class EvoCommGUI:
-    """
-    Main application window for EvoComm.
-
-    Attributes
-    ----------
-    root : tk.Tk
-        The top-level tkinter window.
-    engine : EvolutionEngine or None
-        Active engine instance while evolution is running.
-    _stop_flag : bool
-        Set to True when the user clicks STOP.
-    """
 
     def __init__(self, root: tk.Tk) -> None:
-        """
-        Initialise the window, lay out all widgets, and set initial state.
-
-        Parameters
-        ----------
-        root : tk.Tk
-            The top-level tkinter window.
-        """
         self.root = root
         self.root.title("EvoComm — Evolving Communication Topologies")
         self.root.geometry("1200x750")
@@ -72,19 +211,12 @@ class EvoCommGUI:
         self._stop_flag = False
         self._evo_thread: threading.Thread | None = None
 
-        # Data for live chart
         self._gen_x: list[int] = []
         self._fit_y: list[float] = []
 
         self._build_layout()
 
-    # ------------------------------------------------------------------ #
-    #  Layout construction                                                 #
-    # ------------------------------------------------------------------ #
-
     def _build_layout(self) -> None:
-        """Construct left control panel and right tabbed visualisation panel."""
-        # Root columns: 300px left, flex right
         self.root.columnconfigure(0, minsize=300, weight=0)
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
@@ -93,28 +225,24 @@ class EvoCommGUI:
         self._build_right_panel()
 
     def _build_left_panel(self) -> None:
-        """Build the configuration, run-controls, and context sections."""
         left = tk.Frame(self.root, bg=BG_PANEL, width=300)
         left.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
         left.grid_propagate(False)
         left.columnconfigure(0, weight=1)
 
-        # ── Title ─────────────────────────────────────────────────────────
         tk.Label(left, text="EvoComm", bg=BG_PANEL, fg=ACCENT,
                  font=("Helvetica", 16, "bold")).pack(pady=(14, 0))
         tk.Label(left, text="Evolving Communication Topologies",
                  bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 8)).pack(pady=(0, 10))
         ttk.Separator(left).pack(fill="x", padx=10)
 
-        # ── Configuration section ─────────────────────────────────────────
         self._section_label(left, "Configuration")
 
-        self.var_pop   = self._slider(left, "Population Size", 10, 50, 20, resolution=1)
-        self.var_gen   = self._slider(left, "Generations",     10, 100, 50, resolution=1)
-        self.var_mut   = self._slider(left, "Mutation Rate",   0.1, 0.9, 0.4, resolution=0.1)
-        self.var_agents= self._slider(left, "Num Agents",      4, 12, 6, resolution=1)
+        self.var_pop    = self._slider(left, "Population Size", 10, 50, 20, resolution=1)
+        self.var_gen    = self._slider(left, "Generations",     10, 100, 50, resolution=1)
+        self.var_mut    = self._slider(left, "Mutation Rate",   0.1, 0.9, 0.4, resolution=0.1)
+        self.var_agents = self._slider(left, "Num Agents",      4, 12, 6, resolution=1)
 
-        # Agent mode
         mode_frame = tk.Frame(left, bg=BG_PANEL)
         mode_frame.pack(fill="x", padx=12, pady=(4, 2))
         tk.Label(mode_frame, text="Agent Mode", bg=BG_PANEL, fg=FG_WHITE,
@@ -126,7 +254,6 @@ class EvoCommGUI:
 
         ttk.Separator(left).pack(fill="x", padx=10, pady=8)
 
-        # ── Run controls ──────────────────────────────────────────────────
         self._section_label(left, "Run Controls")
 
         btn_frame = tk.Frame(left, bg=BG_PANEL)
@@ -150,21 +277,18 @@ class EvoCommGUI:
         )
         self.btn_stop.grid(row=0, column=1, sticky="ew", padx=(4, 0), ipady=6)
 
-        # Status label
         self.lbl_status = tk.Label(
             left, text="Ready", bg=BG_PANEL, fg=ACCENT,
             font=("Helvetica", 9, "italic"),
         )
         self.lbl_status.pack(pady=(8, 2))
 
-        # Progress bar
         self.progress = ttk.Progressbar(left, orient="horizontal",
                                         mode="determinate", length=260)
         self.progress.pack(padx=12, pady=(2, 8))
 
         ttk.Separator(left).pack(fill="x", padx=10)
 
-        # ── Scenario context ──────────────────────────────────────────────
         self._section_label(left, "Scenario Context")
         context = (
             "This system models communication network design "
@@ -179,8 +303,17 @@ class EvoCommGUI:
                  font=("Helvetica", 8), wraplength=265,
                  justify="left").pack(padx=12, pady=(0, 12))
 
+        ttk.Separator(left).pack(fill="x", padx=10, pady=(8, 4))
+        self._section_label(left, "Demo")
+        self.btn_live_sim = tk.Button(
+            left, text="LAUNCH LIVE SIMULATION",
+            bg=ACCENT, fg="white", font=("Helvetica", 10, "bold"),
+            relief="flat", cursor="hand2",
+            command=self._open_live_sim_window,
+        )
+        self.btn_live_sim.pack(fill="x", padx=12, pady=(2, 12), ipady=8)
+
     def _build_right_panel(self) -> None:
-        """Build the tabbed notebook with four visualisation tabs."""
         right = tk.Frame(self.root, bg=BG_DARK)
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
         right.rowconfigure(0, weight=1)
@@ -188,8 +321,8 @@ class EvoCommGUI:
 
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TNotebook",          background=BG_DARK,  borderwidth=0)
-        style.configure("TNotebook.Tab",      background=BG_PANEL, foreground=FG_DIM,
+        style.configure("TNotebook",     background=BG_DARK,  borderwidth=0)
+        style.configure("TNotebook.Tab", background=BG_PANEL, foreground=FG_DIM,
                         padding=[12, 6], font=("Helvetica", 10))
         style.map("TNotebook.Tab",
                   background=[("selected", BG_INPUT)],
@@ -203,10 +336,7 @@ class EvoCommGUI:
         self._build_tab_comparison()
         self._build_tab_about()
 
-    # ── Tab 1: Fitness Progress ───────────────────────────────────────────
-
     def _build_tab_fitness(self) -> None:
-        """Create the live fitness-curve tab."""
         frame = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(frame, text="  Fitness Progress  ")
         frame.rowconfigure(0, weight=1)
@@ -223,10 +353,7 @@ class EvoCommGUI:
         self.canvas_fitness.get_tk_widget().grid(row=0, column=0, sticky="nsew",
                                                   padx=8, pady=8)
 
-    # ── Tab 2: Best Topology ─────────────────────────────────────────────
-
     def _build_tab_topology(self) -> None:
-        """Create the best-topology network graph tab."""
         frame = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(frame, text="  Best Topology  ")
         frame.rowconfigure(0, weight=1)
@@ -249,10 +376,7 @@ class EvoCommGUI:
         )
         self.lbl_topo_info.grid(row=1, column=0, pady=(0, 8))
 
-    # ── Tab 3: Topology Comparison ───────────────────────────────────────
-
     def _build_tab_comparison(self) -> None:
-        """Create the baseline-comparison bar-chart tab."""
         frame = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(frame, text="  Topology Comparison  ")
         frame.rowconfigure(0, weight=1)
@@ -276,16 +400,12 @@ class EvoCommGUI:
         )
         self.lbl_cmp_summary.grid(row=1, column=0, pady=(0, 8))
 
-    # ── Tab 4: About ─────────────────────────────────────────────────────
-
     def _build_tab_about(self) -> None:
-        """Create the static about / research-context tab."""
         frame = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(frame, text="  About EvoComm  ")
 
         canvas = tk.Canvas(frame, bg=BG_DARK, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical",
-                                   command=canvas.yview)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -359,12 +479,335 @@ class EvoCommGUI:
             "2026"
         )
 
-    # ------------------------------------------------------------------ #
-    #  Evolution control                                                   #
-    # ------------------------------------------------------------------ #
+    def _open_live_sim_window(self) -> None:
+        if hasattr(self, "_live_sim_window") and self._live_sim_window is not None:
+            try:
+                self._live_sim_window.lift()
+                return
+            except tk.TclError:
+                pass
+
+        if hasattr(self, "_ls_after_id") and self._ls_after_id is not None:
+            self.root.after_cancel(self._ls_after_id)
+            self._ls_after_id = None
+
+        win = tk.Toplevel(self.root)
+        win.title("EvoComm — Live Simulation")
+        win.geometry("900x700")
+        win.configure(bg=BG_DARK)
+        win.resizable(True, True)
+        self._live_sim_window = win
+
+        def _on_close() -> None:
+            if self._ls_after_id is not None:
+                self.root.after_cancel(self._ls_after_id)
+                self._ls_after_id = None
+            self._ls_playing = False
+            self._live_sim_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        self.canvas_live = tk.Canvas(
+            win, width=_CANVAS_PX, height=_CANVAS_PX,
+            bg="#0d0d1a", highlightthickness=0,
+        )
+        self.canvas_live.pack(side="left", padx=10, pady=10)
+
+        ctrl = tk.Frame(win, bg=BG_PANEL)
+        ctrl.pack(side="right", fill="y", padx=(0, 10), pady=10)
+
+        tk.Label(ctrl, text="LIVE SIMULATION", bg=BG_PANEL, fg=ACCENT,
+                 font=("Helvetica", 10, "bold")).pack(pady=(14, 4))
+        ttk.Separator(ctrl).pack(fill="x", padx=10, pady=4)
+
+        self._section_label(ctrl, "Topology")
+        self._ls_topo_var = tk.StringVar(value="Evolved (demo)")
+        topo_options = ["Evolved (demo)", "Ring", "Star", "Full", "Empty"]
+        ttk.OptionMenu(ctrl, self._ls_topo_var, "Evolved (demo)", *topo_options,
+                       command=self._ls_on_topology_change).pack(
+                           fill="x", padx=10, pady=(0, 6))
+
+        self._section_label(ctrl, "Agent Mode")
+        self._ls_mode_var = tk.StringVar(value="cooperative")
+        mode_opts = ["cooperative", "mixed", "strategic"]
+        ttk.OptionMenu(ctrl, self._ls_mode_var, "cooperative", *mode_opts,
+                       command=self._ls_on_mode_change).pack(
+                           fill="x", padx=10, pady=(0, 6))
+
+        self._section_label(ctrl, "Seed")
+        seed_row = tk.Frame(ctrl, bg=BG_PANEL)
+        seed_row.pack(fill="x", padx=10, pady=(0, 6))
+        self._ls_seed_var = tk.StringVar(value="42")
+        tk.Entry(seed_row, textvariable=self._ls_seed_var,
+                 bg=BG_INPUT, fg=FG_WHITE, insertbackground=FG_WHITE,
+                 relief="flat", font=("Helvetica", 10), width=8,
+                 ).pack(side="left")
+
+        ttk.Separator(ctrl).pack(fill="x", padx=10, pady=6)
+
+        btn_row = tk.Frame(ctrl, bg=BG_PANEL)
+        btn_row.pack(fill="x", padx=10, pady=(0, 4))
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+
+        self._ls_play_btn = tk.Button(
+            btn_row, text="▶ Play",
+            bg=GREEN, fg="white", font=("Helvetica", 10, "bold"),
+            relief="flat", cursor="hand2",
+            command=self._ls_toggle_play,
+        )
+        self._ls_play_btn.grid(row=0, column=0, sticky="ew", padx=(0, 2), ipady=5)
+
+        self._ls_step_btn = tk.Button(
+            btn_row, text="Step",
+            bg=BG_INPUT, fg=FG_WHITE, font=("Helvetica", 10, "bold"),
+            relief="flat", cursor="hand2",
+            command=self._ls_step_once,
+        )
+        self._ls_step_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0), ipady=5)
+
+        tk.Button(
+            ctrl, text="Reset",
+            bg=ORANGE, fg="white", font=("Helvetica", 10, "bold"),
+            relief="flat", cursor="hand2",
+            command=self._ls_reset,
+        ).pack(fill="x", padx=10, pady=(2, 6), ipady=5)
+
+        self._section_label(ctrl, "Speed (ms / step)")
+        self._ls_speed_var = tk.DoubleVar(value=300)
+        tk.Scale(
+            ctrl, variable=self._ls_speed_var, from_=50, to=1000, resolution=50,
+            orient="horizontal", bg=BG_PANEL, fg=FG_WHITE,
+            highlightthickness=0, troughcolor=BG_INPUT,
+            activebackground=ACCENT, sliderrelief="flat", showvalue=True,
+        ).pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Separator(ctrl).pack(fill="x", padx=10, pady=6)
+
+        self._section_label(ctrl, "Status")
+        self._ls_lbl_step = tk.Label(ctrl, text="Step: —", bg=BG_PANEL,
+                                      fg=FG_WHITE, font=("Helvetica", 9))
+        self._ls_lbl_step.pack(anchor="w", padx=12)
+
+        self._ls_lbl_tasks = tk.Label(ctrl, text="Tasks: —", bg=BG_PANEL,
+                                       fg=FG_WHITE, font=("Helvetica", 9))
+        self._ls_lbl_tasks.pack(anchor="w", padx=12)
+
+        self._ls_lbl_msgs = tk.Label(ctrl, text="Messages: —", bg=BG_PANEL,
+                                      fg=FG_WHITE, font=("Helvetica", 9))
+        self._ls_lbl_msgs.pack(anchor="w", padx=12)
+
+        self._ls_lbl_topo = tk.Label(ctrl, text="Topology: —", bg=BG_PANEL,
+                                      fg=FG_DIM, font=("Helvetica", 8),
+                                      wraplength=200, justify="left")
+        self._ls_lbl_topo.pack(anchor="w", padx=12, pady=(4, 0))
+
+        self._ls_runner  = LiveSimulationRunner()
+        self._ls_playing = False
+        self._ls_after_id: str | None = None
+
+        win.update()
+        win.after(50, self._ls_reset)
+
+    def _render_live_sim(self, state: dict) -> None:
+        if not state:
+            return
+
+        cv        = self.canvas_live
+        positions = state["positions"]
+        adj       = state["adjacency_matrix"]
+        n_agents  = state["num_agents"]
+
+        cv.delete("all")
+
+        grid_end = _MARGIN + 10 * _CELL_SIZE
+        for i in range(11):
+            x = _MARGIN + i * _CELL_SIZE
+            cv.create_line(x, _MARGIN, x, grid_end, fill="#1f2030", width=1)
+            cv.create_line(_MARGIN, x, grid_end, x, fill="#1f2030", width=1)
+
+        halo_r = int(2.5 * _CELL_SIZE)
+        for i, (row, col) in enumerate(positions):
+            cx, cy = _cell_to_px(row, col)
+            cv.create_oval(cx - halo_r, cy - halo_r,
+                           cx + halo_r, cy + halo_r,
+                           fill="#161628", outline="")
+
+        for i in range(n_agents):
+            for j in range(i + 1, n_agents):
+                if adj[i][j]:
+                    x1, y1 = _cell_to_px(*positions[i])
+                    x2, y2 = _cell_to_px(*positions[j])
+                    cv.create_line(x1, y1, x2, y2, fill="#555566", width=1)
+
+        _shade = {3: 1.0, 2: 0.6, 1: 0.3}
+        for (sender_id, recv_id), frames in state["flash_edges"].items():
+            if sender_id >= n_agents or recv_id >= n_agents:
+                continue
+            base  = _AGENT_COLORS[sender_id % len(_AGENT_COLORS)]
+            color = _dim_color(base, _shade.get(frames, 0.3))
+            width = 2 + 3 * (frames / 3)
+            x1, y1 = _cell_to_px(*positions[sender_id])
+            x2, y2 = _cell_to_px(*positions[recv_id])
+            cv.create_line(x1, y1, x2, y2, fill=color, width=width)
+
+        for task in state["all_tasks"]:
+            tr, tc = task["position"]
+            tx, ty = _cell_to_px(tr, tc)
+            if task["completed"]:
+                r = 14
+                cv.create_oval(tx - r, ty - r, tx + r, ty + r,
+                               fill="#43a047", outline="#66bb6a", width=1)
+                cv.create_text(tx, ty, text="✓", fill="white",
+                               font=("Helvetica", 11, "bold"))
+            else:
+                d = 11
+                cv.create_line(tx - d, ty - d, tx + d, ty + d,
+                               fill="#e53935", width=3)
+                cv.create_line(tx + d, ty - d, tx - d, ty + d,
+                               fill="#e53935", width=3)
+                cv.create_text(tx + 14, ty + 14,
+                               text=f"T{task['id']}×{task['required_agents']}",
+                               fill="#ff8a80", font=("Helvetica", 8), anchor="nw")
+
+        known_per_agent = state["known_tasks"]
+        for i, (row, col) in enumerate(positions):
+            color = _AGENT_COLORS[i % len(_AGENT_COLORS)]
+            known = known_per_agent[i] if i < len(known_per_agent) else {}
+            total_k = max(len(known), 1)
+            for k, tinfo in enumerate(known.values()):
+                tr, tc = tinfo["position"]
+                tx, ty = _cell_to_px(tr, tc)
+                angle  = k * (2 * math.pi / total_k)
+                mx = tx + int(14 * math.cos(angle))
+                my = ty + int(14 * math.sin(angle))
+                r = 4
+                cv.create_oval(mx - r, my - r, mx + r, my + r,
+                               fill=color, outline="")
+
+        for i, (row, col) in enumerate(positions):
+            color = _AGENT_COLORS[i % len(_AGENT_COLORS)]
+            cx, cy = _cell_to_px(row, col)
+            r = 16
+            cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                           fill=color, outline="white", width=2)
+            cv.create_text(cx, cy, text=str(i), fill="white",
+                           font=("Helvetica", 11, "bold"))
+
+        if state.get("mission_complete"):
+            mid = _CANVAS_PX // 2
+            cv.create_rectangle(mid - 190, mid - 44, mid + 190, mid + 44,
+                                fill="#0d0d1a", stipple="gray50",
+                                outline="#43a047", width=2)
+            cv.create_text(mid, mid, text="MISSION COMPLETE",
+                           fill="#43a047", font=("Helvetica", 22, "bold"))
+
+        cv.create_text(
+            _CANVAS_PX // 2, 8,
+            text=(f"Step {state['step_count']}  |  "
+                  f"Tasks {state['tasks_done']}/{state['tasks_total']}  |  "
+                  f"Messages {state['total_messages']}"),
+            fill=FG_WHITE, font=("Helvetica", 9), anchor="n",
+        )
+        cv.update_idletasks()
+
+    def _update_ls_status(self, state: dict) -> None:
+        if not state:
+            return
+        self._ls_lbl_step.config(text=f"Step: {state['step_count']}")
+        done  = state["tasks_done"]
+        total = state["tasks_total"]
+        self._ls_lbl_tasks.config(
+            text=f"Tasks: {done}/{total}",
+            fg=GREEN if done == total else FG_WHITE,
+        )
+        self._ls_lbl_msgs.config(text=f"Messages: {state['total_messages']}")
+
+    def _ls_show_error(self, msg: str) -> None:
+        self.canvas_live.delete("all")
+        self.canvas_live.create_text(
+            _CANVAS_PX // 2, _CANVAS_PX // 2,
+            text=msg, fill="#e53935", font=("Helvetica", 11),
+            width=400, anchor="center",
+        )
+        self._ls_play_btn.config(state="disabled")
+        self._ls_step_btn.config(state="disabled")
+
+    def _ls_toggle_play(self) -> None:
+        self._ls_playing = not self._ls_playing
+        if self._ls_playing:
+            self._ls_play_btn.config(text="⏸ Pause", bg=ORANGE)
+            self._ls_step_btn.config(state="disabled")
+            self._ls_play_loop()
+        else:
+            self._ls_play_btn.config(text="▶ Play", bg=GREEN)
+            self._ls_step_btn.config(state="normal")
+            if self._ls_after_id is not None:
+                self.root.after_cancel(self._ls_after_id)
+                self._ls_after_id = None
+
+    def _ls_play_loop(self) -> None:
+        if not self._ls_playing:
+            return
+        self._ls_do_step()
+        if not self._ls_runner.mission_complete:
+            delay = int(self._ls_speed_var.get())
+            self._ls_after_id = self.root.after(delay, self._ls_play_loop)
+        else:
+            self._ls_playing = False
+            self._ls_play_btn.config(text="▶ Play", bg=GREEN)
+            self._ls_step_btn.config(state="normal")
+
+    def _ls_do_step(self) -> None:
+        state = self._ls_runner.step()
+        self._render_live_sim(state)
+        self._update_ls_status(state)
+
+    def _ls_step_once(self) -> None:
+        if not self._ls_playing:
+            self._ls_do_step()
+
+    def _ls_reset(self) -> None:
+        if self._ls_playing:
+            self._ls_toggle_play()
+
+        topo_name = self._ls_topo_var.get()
+        err = self._ls_runner.load_topology(topo_name)
+        if err:
+            self._ls_show_error(err)
+            return
+
+        try:
+            seed = int(self._ls_seed_var.get())
+        except ValueError:
+            seed = 42
+            self._ls_seed_var.set("42")
+
+        self._ls_runner.reset(seed=seed)
+        self._ls_play_btn.config(state="normal")
+        self._ls_step_btn.config(state="normal")
+
+        g = self._ls_runner.topology_genome
+        if g is not None:
+            conn = "connected" if g.is_connected() else "DISCONNECTED"
+            self._ls_lbl_topo.config(
+                text=f"{topo_name} | density={g.graph_density:.2f} | {conn}",
+                fg=GREEN if g.is_connected() else RED,
+            )
+
+        state = self._ls_runner._state()
+        self._render_live_sim(state)
+        self._update_ls_status(state)
+
+    def _ls_on_topology_change(self, name: str) -> None:
+        self._ls_reset()
+
+    def _ls_on_mode_change(self, mode: str) -> None:
+        self._ls_runner.agent_mode = mode
+        self._ls_reset()
 
     def _start_evolution(self) -> None:
-        """Read controls, build engine, and launch the background thread."""
         self._stop_flag = False
         self._gen_x.clear()
         self._fit_y.clear()
@@ -386,14 +829,12 @@ class EvoCommGUI:
         )
         self.engine._stop_requested = False
 
-        # Reset UI
         self.progress["maximum"] = n_gen
         self.progress["value"]   = 0
         self._set_status("Running... Gen 0/" + str(n_gen), ACCENT)
         self.btn_run.config(state="disabled")
         self.btn_stop.config(state="normal")
 
-        # Clear fitness chart
         self._reset_fitness_chart()
 
         self._evo_thread = threading.Thread(
@@ -402,40 +843,25 @@ class EvoCommGUI:
         self._evo_thread.start()
 
     def _evolution_worker(self) -> None:
-        """Run in a background thread — calls engine.run()."""
         try:
             self.engine.run()
         except Exception as exc:
-            self.root.after(0, lambda: self._set_status(
-                f"Error: {exc}", RED
-            ))
+            self.root.after(0, lambda: self._set_status(f"Error: {exc}", RED))
             self.root.after(0, self._re_enable_run)
 
     def _stop_evolution(self) -> None:
-        """Signal the engine to stop at the next generation boundary."""
         if self.engine:
             self.engine._stop_requested = True
         self._set_status("Stopping...", ORANGE)
         self.btn_stop.config(state="disabled")
 
-    # ------------------------------------------------------------------ #
-    #  Callbacks from engine (called from background thread)              #
-    # ------------------------------------------------------------------ #
-
     def _on_generation(self, gen_num: int, best_fitness: float) -> None:
-        """Received each generation — marshals update onto the main thread."""
         self.root.after(0, self._update_generation_ui, gen_num, best_fitness)
 
     def _on_complete(self, best_genome: TopologyGenome) -> None:
-        """Received when evolution finishes — marshals onto main thread."""
         self.root.after(0, self._update_complete_ui, best_genome)
 
-    # ------------------------------------------------------------------ #
-    #  Main-thread UI update methods                                      #
-    # ------------------------------------------------------------------ #
-
     def _update_generation_ui(self, gen_num: int, best_fitness: float) -> None:
-        """Update progress bar, status, and live fitness chart."""
         total = self.engine.num_generations if self.engine else gen_num
         self._set_status(f"Running... Gen {gen_num}/{total}", ACCENT)
         self.progress["value"] = gen_num
@@ -449,8 +875,6 @@ class EvoCommGUI:
         self.canvas_fitness.draw_idle()
 
     def _update_complete_ui(self, best_genome: TopologyGenome) -> None:
-        """Render topology graph, trigger comparison, finalize UI."""
-        total = self.engine.num_generations if self.engine else "?"
         self._set_status(
             f"Complete — fitness {best_genome.fitness_score:.4f}", GREEN
         )
@@ -465,7 +889,6 @@ class EvoCommGUI:
         ).start()
 
     def _render_topology(self, genome: TopologyGenome) -> None:
-        """Draw the best topology network graph in the topology tab."""
         self.ax_topo.clear()
         self._style_axis(self.ax_topo,
                          f"Best Topology  |  density={genome.graph_density:.2f}"
@@ -505,7 +928,6 @@ class EvoCommGUI:
         )
 
     def _run_comparison_worker(self, evolved_genome: TopologyGenome) -> None:
-        """Build baselines and evaluate all topologies (background thread)."""
         try:
             n = evolved_genome.num_agents
             full_mat = np.ones((n, n), dtype=bool)
@@ -536,14 +958,13 @@ class EvoCommGUI:
             ))
 
     def _update_comparison_ui(self, scores: dict[str, float]) -> None:
-        """Render the comparison bar chart on the main thread."""
         self.ax_cmp.clear()
         self._style_axis(self.ax_cmp,
                          "Topology Comparison (10 trials each)",
                          "Topology", "Fitness Score")
 
-        names  = list(scores.keys())
-        values = list(scores.values())
+        names   = list(scores.keys())
+        values  = list(scores.values())
         colours = [ORANGE if n == "Evolved" else "#607d8b" for n in names]
 
         bars = self.ax_cmp.bar(names, values, color=colours, alpha=0.85,
@@ -562,25 +983,16 @@ class EvoCommGUI:
             text=f"Evolved topology ranked {rank} of {len(scores)} topologies",
             fg=GREEN if rank == 1 else FG_DIM,
         )
-
-        # Switch to comparison tab automatically
         self.notebook.select(2)
 
-    # ------------------------------------------------------------------ #
-    #  Helper utilities                                                    #
-    # ------------------------------------------------------------------ #
-
     def _re_enable_run(self) -> None:
-        """Restore run button and disable stop button."""
         self.btn_run.config(state="normal")
         self.btn_stop.config(state="disabled")
 
     def _set_status(self, text: str, colour: str = FG_WHITE) -> None:
-        """Update the status label text and colour."""
         self.lbl_status.config(text=text, fg=colour)
 
     def _reset_fitness_chart(self) -> None:
-        """Clear the fitness axes ready for a new run."""
         self.ax_fitness.clear()
         self._style_axis(self.ax_fitness, "EvoComm — Fitness Progress",
                          "Generation", "Best Fitness Score")
@@ -590,7 +1002,6 @@ class EvoCommGUI:
         self.canvas_fitness.draw_idle()
 
     def _section_label(self, parent: tk.Widget, text: str) -> None:
-        """Render a small section header inside a panel."""
         tk.Label(parent, text=text.upper(), bg=BG_PANEL, fg=ACCENT,
                  font=("Helvetica", 8, "bold")).pack(anchor="w",
                                                       padx=12, pady=(8, 2))
@@ -604,24 +1015,6 @@ class EvoCommGUI:
         default: float,
         resolution: float = 1,
     ) -> tk.DoubleVar:
-        """
-        Add a labelled Scale slider to *parent* and return its variable.
-
-        Parameters
-        ----------
-        parent : tk.Widget
-            Container frame.
-        label : str
-            Display label.
-        from_ : float
-            Minimum value.
-        to : float
-            Maximum value.
-        default : float
-            Initial value.
-        resolution : float
-            Slider step size.
-        """
         var = tk.DoubleVar(value=default)
         frame = tk.Frame(parent, bg=BG_PANEL)
         frame.pack(fill="x", padx=12, pady=2)
@@ -629,9 +1022,8 @@ class EvoCommGUI:
         tk.Label(frame, text=label, bg=BG_PANEL, fg=FG_WHITE,
                  font=("Helvetica", 9), width=16, anchor="w").pack(side="left")
 
-        val_lbl = tk.Label(frame, textvariable=var, bg=BG_PANEL,
-                           fg=ACCENT, font=("Helvetica", 9), width=5)
-        val_lbl.pack(side="right")
+        tk.Label(frame, textvariable=var, bg=BG_PANEL,
+                 fg=ACCENT, font=("Helvetica", 9), width=5).pack(side="right")
 
         tk.Scale(
             parent, variable=var, from_=from_, to=to, resolution=resolution,
@@ -645,7 +1037,6 @@ class EvoCommGUI:
 
     @staticmethod
     def _style_axis(ax, title: str, xlabel: str, ylabel: str) -> None:
-        """Apply consistent dark-theme styling to a matplotlib Axes."""
         ax.set_facecolor(BG_PANEL)
         ax.figure.patch.set_facecolor(BG_DARK)
         ax.set_title(title, color=FG_WHITE, fontsize=11, pad=10)
@@ -656,8 +1047,6 @@ class EvoCommGUI:
             spine.set_edgecolor(BG_INPUT)
         ax.grid(True, linestyle="--", alpha=0.3, color=FG_DIM)
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     root = tk.Tk()

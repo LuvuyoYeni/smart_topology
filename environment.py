@@ -40,6 +40,15 @@ class Environment:
         """Return only the tasks not yet completed."""
         return [t for t in self.tasks if not t["completed"]]
 
+    def get_observable_tasks(self, position, radius=2):
+        """Return active tasks within Manhattan distance *radius* of *position*."""
+        row, col = position
+        return [
+            t for t in self.tasks
+            if not t["completed"]
+            and abs(t["position"][0] - row) + abs(t["position"][1] - col) <= radius
+        ]
+
     def update(self, agent_positions):
         """
         Called once per time step.

@@ -1,15 +1,7 @@
-"""
-statistical_analysis.py
------------------------
-Gap 1 — Statistical robustness testing for EvoComm.
-
-Evaluates topologies across many independent trials and applies
-Mann-Whitney U tests to determine whether the evolved topology
-significantly outperforms hand-crafted baselines.
-"""
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -39,33 +31,10 @@ class StatisticalAnalyser:
         agent_mode: str = "cooperative",
         n_trials: int = 30,
     ) -> list[float]:
-        """
-        Evaluate *genome* independently *n_trials* times.
-
-        Each trial uses a fresh FitnessEvaluator with num_trials=1 so
-        every score comes from a single simulation run, giving the full
-        variance of the fitness landscape rather than an averaged view.
-
-        Parameters
-        ----------
-        genome : TopologyGenome
-            The topology to evaluate.
-        agent_mode : str
-            Agent behaviour mode: ``"cooperative"``, ``"strategic"``,
-            or ``"mixed"``.
-        n_trials : int
-            Number of independent evaluations.
-
-        Returns
-        -------
-        list[float]
-            Raw fitness scores, one per trial.
-        """
-        scores: list[float] = []
+        scores = []
         for _ in range(n_trials):
-            evaluator = FitnessEvaluator(num_trials=1, agent_mode=agent_mode)
-            score = evaluator.evaluate(genome)
-            scores.append(score)
+            evaluator = FitnessEvaluator(num_trials=5, agent_mode=agent_mode)
+            scores.append(evaluator.evaluate(genome))
         return scores
 
     def compare_topologies(
@@ -74,25 +43,7 @@ class StatisticalAnalyser:
         agent_mode: str = "cooperative",
         n_trials: int = 30,
     ) -> dict:
-        """
-        Run *n_trials* independent evaluations for every topology.
-
-        Parameters
-        ----------
-        topologies : dict[str, TopologyGenome]
-            Mapping of name → genome.
-        agent_mode : str
-            Agent behaviour mode used for all evaluations.
-        n_trials : int
-            Trials per topology.
-
-        Returns
-        -------
-        dict
-            For each topology name:
-            ``mean``, ``std``, ``min``, ``max``, ``median``, ``scores``.
-        """
-        results: dict = {}
+        results = {}
         total = len(topologies)
         for idx, (name, genome) in enumerate(topologies.items(), 1):
             print(f"  [{idx}/{total}] Evaluating {name} ({n_trials} trials)...",
@@ -111,26 +62,7 @@ class StatisticalAnalyser:
                   f"std={results[name]['std']:.3f}")
         return results
 
-    def significance_table(self, results: dict) -> None:
-        """
-        Print a formatted significance table.
-
-        Each topology is compared against Evol-Coop using a one-sided
-        Mann-Whitney U test (alternative='less'), asking: "is this
-        topology's fitness distribution shifted below Evol-Coop's?"
-
-        Significance labels:
-          p < 0.001 → ***
-          p < 0.01  → **
-          p < 0.05  → *
-          otherwise → ns
-
-        Parameters
-        ----------
-        results : dict
-            Output of :meth:`compare_topologies`.
-        """
-        ref_key = "Evol-Coop"
+    def significance_table(self, results: dict, ref_key: str = "Evol-Coop") -> None:
         ref_scores = results[ref_key]["scores"] if ref_key in results else None
 
         col_name  = 14
@@ -172,20 +104,11 @@ class StatisticalAnalyser:
                   f"{sig:<{col_sig}}")
 
     def plot_distributions(
-        self, results: dict, title_suffix: str = "Cooperative Agents"
+        self,
+        results: dict,
+        title_suffix: str = "Cooperative Agents",
+        out_path: str = "results/stat_boxplot.png",
     ) -> None:
-        """
-        Boxplot of fitness distributions with jittered data point overlay.
-
-        Saves to ``results/stat_boxplot.png`` and calls ``plt.show()``.
-
-        Parameters
-        ----------
-        results : dict
-            Output of :meth:`compare_topologies`.
-        title_suffix : str
-            Appended to the plot title after the em-dash.
-        """
         os.makedirs("results", exist_ok=True)
 
         names  = list(results.keys())
@@ -202,12 +125,11 @@ class StatisticalAnalyser:
         )
 
         colours = ["steelblue", "cornflowerblue", "salmon",
-                   "sandybrown", "mediumseagreen"]
+                   "sandybrown", "mediumseagreen", "mediumpurple"]
         for patch, colour in zip(bp["boxes"], colours):
             patch.set_facecolor(colour)
             patch.set_alpha(0.6)
 
-        # Jittered scatter overlay
         rng = np.random.default_rng(seed=0)
         for i, sc in enumerate(scores, 1):
             jitter = rng.uniform(-0.1, 0.1, size=len(sc))
@@ -230,7 +152,6 @@ class StatisticalAnalyser:
         ax.grid(axis="y", linestyle="--", alpha=0.5)
         plt.tight_layout()
 
-        out_path = os.path.join("results", "stat_boxplot.png")
         plt.savefig(out_path, dpi=150)
         print(f"\n  Saved: {out_path}")
         plt.show()
@@ -241,30 +162,13 @@ class StatisticalAnalyser:
 if __name__ == "__main__":
     np.random.seed(42)
 
-    EVOL_COOP_MATRIX = np.array([
-        [0,0,0,1,0,1],
-        [0,0,0,1,0,1],
-        [0,0,0,0,1,0],
-        [1,1,0,0,0,0],
-        [0,0,1,0,0,1],
-        [1,1,0,0,1,0],
-    ], dtype=bool)
+    for _path in ["results/evolved_coop.npz", "results/evolved_strat.npz"]:
+        if not os.path.exists(_path):
+            raise FileNotFoundError("Run main.py first to generate evolved genomes.")
 
-    EVOL_STRAT_MATRIX = np.array([
-        [0,0,1,1,1,0],
-        [0,0,1,1,1,0],
-        [1,1,0,1,1,1],
-        [1,1,1,0,1,1],
-        [1,1,1,1,0,0],
-        [0,0,1,1,0,0],
-    ], dtype=bool)
+    EVOL_COOP_MATRIX = np.load("results/evolved_coop.npz")["adjacency_matrix"]
+    EVOL_STRAT_MATRIX = np.load("results/evolved_strat.npz")["adjacency_matrix"]
 
-    if EVOL_COOP_MATRIX is None or EVOL_STRAT_MATRIX is None:
-        print("Please fill in evolved matrices from your last run.")
-        print("Set EVOL_COOP_MATRIX and EVOL_STRAT_MATRIX as numpy bool arrays.")
-        sys.exit(0)
-
-    # ── Build topologies ──────────────────────────────────────────────────────
     NUM_AGENTS = 6
 
     full_mat = np.ones((NUM_AGENTS, NUM_AGENTS), dtype=bool)
@@ -279,33 +183,34 @@ if __name__ == "__main__":
     for i in range(1, NUM_AGENTS):
         star_mat[0][i] = star_mat[i][0] = True
 
-    topologies: dict[str, TopologyGenome] = {
-        "Evol-Coop":  TopologyGenome(NUM_AGENTS, EVOL_COOP_MATRIX),
-        "Evol-Strat": TopologyGenome(NUM_AGENTS, EVOL_STRAT_MATRIX),
-        "Full":       TopologyGenome(NUM_AGENTS, full_mat),
-        "Ring":       TopologyGenome(NUM_AGENTS, ring_mat),
-        "Star":       TopologyGenome(NUM_AGENTS, star_mat),
-    }
+    def _build_topologies() -> dict:
+        topo = {
+            "Evol-Coop":  TopologyGenome(NUM_AGENTS, EVOL_COOP_MATRIX),
+            "Evol-Strat": TopologyGenome(NUM_AGENTS, EVOL_STRAT_MATRIX),
+            "Full":       TopologyGenome(NUM_AGENTS, full_mat),
+            "Ring":       TopologyGenome(NUM_AGENTS, ring_mat),
+            "Star":       TopologyGenome(NUM_AGENTS, star_mat),
+        }
+        rand_path = "results/random_best_coop.npz"
+        if os.path.exists(rand_path):
+            rand_mat = np.load(rand_path)["adjacency_matrix"]
+            topo["Random-Best"] = TopologyGenome(NUM_AGENTS, rand_mat)
+        else:
+            print("  (random_best_coop.npz not found — run random_baseline.py to include it)")
+        return topo
 
-    # ── Run analysis ──────────────────────────────────────────────────────────
     analyser = StatisticalAnalyser()
+    os.makedirs("results", exist_ok=True)
 
-    print("\n=== Statistical Analysis — 30 trials, cooperative agents ===\n")
-    results = analyser.compare_topologies(
-        topologies, agent_mode="cooperative", n_trials=30
-    )
-
-    analyser.significance_table(results)
-    analyser.plot_distributions(results)
-
-    # ── Plain-English summary ─────────────────────────────────────────────────
-    ref = results.get("Evol-Coop")
-    if ref:
+    def _summarise(results: dict, ref_key: str) -> None:
+        ref = results.get(ref_key)
+        if not ref:
+            return
         sig_count = 0
         total_baselines = 0
         ref_scores = ref["scores"]
         for name, data in results.items():
-            if name == "Evol-Coop":
+            if name == ref_key:
                 continue
             total_baselines += 1
             _, p = stats.mannwhitneyu(
@@ -313,5 +218,37 @@ if __name__ == "__main__":
             )
             if p < 0.05:
                 sig_count += 1
-        print(f"\n  Summary: Evol-Coop significantly outperformed "
+        print(f"\n  Summary: {ref_key} significantly outperformed "
               f"{sig_count} of {total_baselines} baselines (p < 0.05).")
+
+    # ── Cooperative analysis ──────────────────────────────────────────────────
+    print("\n=== Statistical Analysis — 30 trials, cooperative agents ===\n")
+    results_coop = analyser.compare_topologies(
+        _build_topologies(), agent_mode="cooperative", n_trials=30
+    )
+    analyser.significance_table(results_coop, ref_key="Evol-Coop")
+    analyser.plot_distributions(
+        results_coop,
+        title_suffix="Cooperative Agents",
+        out_path="results/stat_boxplot_coop.png",
+    )
+    with open("results/stat_scores_coop.json", "w") as _f:
+        json.dump({n: d["scores"] for n, d in results_coop.items()}, _f, indent=2)
+    print("  Saved: results/stat_scores_coop.json")
+    _summarise(results_coop, "Evol-Coop")
+
+    # ── Strategic analysis ────────────────────────────────────────────────────
+    print("\n=== Statistical Analysis — 30 trials, strategic agents ===\n")
+    results_strat = analyser.compare_topologies(
+        _build_topologies(), agent_mode="strategic", n_trials=30
+    )
+    analyser.significance_table(results_strat, ref_key="Evol-Strat")
+    analyser.plot_distributions(
+        results_strat,
+        title_suffix="Strategic Agents",
+        out_path="results/stat_boxplot_strat.png",
+    )
+    with open("results/stat_scores_strat.json", "w") as _f:
+        json.dump({n: d["scores"] for n, d in results_strat.items()}, _f, indent=2)
+    print("  Saved: results/stat_scores_strat.json")
+    _summarise(results_strat, "Evol-Strat")

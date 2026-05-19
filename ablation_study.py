@@ -1,12 +1,3 @@
-"""
-ablation_study.py
------------------
-Gap 2 — Ablation study showing how fitness-function weights shape
-the topology the EA converges to.
-
-Four configurations are run, varying task/speed/message weights,
-and the resulting evolved structures are compared.
-"""
 
 from __future__ import annotations
 
@@ -22,28 +13,8 @@ from topology_genome import TopologyGenome
 
 
 class AblationStudy:
-    """
-    Runs the evolutionary algorithm under different fitness-function
-    weight configurations and compares the evolved topologies.
-    """
 
-    def run_config(self, config: dict, label: str) -> TopologyGenome:
-        """
-        Evolve a topology using a custom fitness-function configuration.
-
-        Parameters
-        ----------
-        config : dict
-            Keys: ``task_weight``, ``speed_weight``, ``msg_weight``,
-            ``num_agents``.
-        label : str
-            Human-readable name for progress output.
-
-        Returns
-        -------
-        TopologyGenome
-            Best genome found after 50 generations.
-        """
+    def run_config(self, config: dict, label: str) -> tuple[TopologyGenome, dict]:
         print(f"  Running config: {label}  "
               f"(task={config['task_weight']}, "
               f"speed={config['speed_weight']}, "
@@ -53,28 +24,10 @@ class AblationStudy:
         evaluator = FitnessEvaluator(
             task_weight=config["task_weight"],
             efficiency_weight=config["speed_weight"],
+            msg_weight=config["msg_weight"],
             num_trials=5,
             agent_mode="cooperative",
         )
-
-        # Patch compute_fitness to use the ablation weights
-        msg_weight = config["msg_weight"]
-        original_compute = evaluator.compute_fitness.__func__
-
-        from fitness_evaluator import SimResult, _MAX_STEPS
-
-        def patched_compute(self_inner, result: SimResult) -> float:
-            speed_bonus = (_MAX_STEPS - result.steps_taken) / _MAX_STEPS
-            msg_penalty = min(result.message_count / 30.0, 1.0)
-            fitness = (
-                config["task_weight"] * result.task_score
-                + config["speed_weight"] * speed_bonus
-                - msg_weight * msg_penalty
-            )
-            return round(max(fitness, 0.0), 4)
-
-        import types
-        evaluator.compute_fitness = types.MethodType(patched_compute, evaluator)
 
         engine = EvolutionEngine(
             num_agents=config["num_agents"],
@@ -86,24 +39,29 @@ class AblationStudy:
 
         best = engine.run()
         print(f"    -> {best}")
-        return best
 
-    def run_all(self) -> dict[str, TopologyGenome]:
-        """
-        Run the four ablation configurations in order.
+        sim_eval = FitnessEvaluator(
+            task_weight=config["task_weight"],
+            efficiency_weight=config["speed_weight"],
+            msg_weight=config["msg_weight"],
+            num_trials=1,
+            agent_mode="cooperative",
+        )
+        task_scores, msg_counts, steps_list = [], [], []
+        for _ in range(10):
+            res = sim_eval.run_simulation(best)
+            task_scores.append(res.task_score)
+            msg_counts.append(res.message_count)
+            steps_list.append(res.steps_taken)
 
-        Configurations
-        --------------
-        A_current    : task=0.6, speed=0.3, msg=0.3  (baseline)
-        B_task_heavy : task=0.9, speed=0.1, msg=0.0  (ignore efficiency)
-        C_efficiency : task=0.4, speed=0.2, msg=0.4  (punish messages hard)
-        D_speed      : task=0.4, speed=0.5, msg=0.1  (reward fast coordination)
+        metrics = {
+            "task_score":    float(np.mean(task_scores)),
+            "message_count": float(np.mean(msg_counts)),
+            "steps_taken":   float(np.mean(steps_list)),
+        }
+        return best, metrics
 
-        Returns
-        -------
-        dict[str, TopologyGenome]
-            Maps configuration label → best genome.
-        """
+    def run_all(self) -> tuple[dict[str, TopologyGenome], dict[str, dict]]:
         configs = [
             {"label": "A_current",    "task_weight": 0.6, "speed_weight": 0.3,
              "msg_weight": 0.3, "num_agents": 6},
@@ -114,66 +72,31 @@ class AblationStudy:
             {"label": "D_speed",      "task_weight": 0.4, "speed_weight": 0.5,
              "msg_weight": 0.1, "num_agents": 6},
         ]
-        results: dict[str, TopologyGenome] = {}
+        results = {}
+        metrics = {}
         for cfg in configs:
             label = cfg.pop("label")
-            results[label] = self.run_config(cfg, label)
-        return results
+            results[label], metrics[label] = self.run_config(cfg, label)
+        return results, metrics
 
-    def print_comparison(self, results: dict[str, TopologyGenome]) -> None:
-        """
-        Print a table comparing evolved topology structure across configs.
-
-        Interpretation is auto-generated from density and connectivity.
-
-        Parameters
-        ----------
-        results : dict[str, TopologyGenome]
-            Output of :meth:`run_all`.
-        """
-        header = (f"{'Config':<14} {'Fitness':>8}  {'Density':>8}  "
-                  f"{'Connected':>10}  {'MaxDeg':>7}  Interpretation")
-        rule = "─" * 75
+    def print_comparison(
+        self, results: dict[str, TopologyGenome], metrics: dict[str, dict]
+    ) -> None:
+        header = (f"{'Config':<14} {'TaskScore':>10}  {'MsgCount':>9}  "
+                  f"{'Steps':>6}  {'Density':>8}  {'EvolvedFitness':>15}")
+        rule = "─" * 70
         print(f"\n{header}")
         print(rule)
 
         for label, genome in results.items():
-            density = genome.graph_density
-            connected = genome.is_connected()
-            max_deg = max(
-                int(genome.adjacency_matrix[i].sum())
-                for i in range(genome.num_agents)
-            )
-
-            if density > 0.7:
-                interp = "dense — efficiency ignored"
-            elif density < 0.3:
-                interp = "sparse — may sacrifice coordination"
-            else:
-                interp = "balanced"
-            if not connected:
-                interp += " (disconnected!)"
-
-            print(f"{label:<14} {genome.fitness_score:>8.4f}  "
-                  f"{density:>8.4f}  "
-                  f"{'yes' if connected else 'NO':>10}  "
-                  f"{max_deg:>7}  {interp}")
+            m = metrics[label]
+            print(f"{label:<14} {m['task_score']:>10.3f}  "
+                  f"{m['message_count']:>9.1f}  "
+                  f"{m['steps_taken']:>6.1f}  "
+                  f"{genome.graph_density:>8.4f}  "
+                  f"{genome.fitness_score:>15.4f}")
 
     def visualise_all(self, results: dict[str, TopologyGenome]) -> None:
-        """
-        Draw a 2×2 grid of topology graphs, one per configuration.
-
-        Nodes are steelblue, edges are grey.  Each subplot is titled
-        with the config label, density, and fitness.
-
-        Saves to ``results/ablation_topologies.png`` and calls
-        ``plt.show()``.
-
-        Parameters
-        ----------
-        results : dict[str, TopologyGenome]
-            Output of :meth:`run_all`.
-        """
         os.makedirs("results", exist_ok=True)
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 12))
@@ -209,26 +132,13 @@ class AblationStudy:
         plt.show()
 
 
-# ── Standalone entry point ────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     np.random.seed(42)
     print("Ablation Study — varying fitness-function weights")
     print("Warning: this runs 4 evolutionary experiments — ~4 minutes\n")
 
     study = AblationStudy()
-    results = study.run_all()
+    results, metrics = study.run_all()
 
-    study.print_comparison(results)
+    study.print_comparison(results, metrics)
     study.visualise_all(results)
-
-    # ── Conclusion ────────────────────────────────────────────────────────────
-    density_a = results["A_current"].graph_density
-    density_b = results["B_task_heavy"].graph_density
-    density_c = results["C_efficiency"].graph_density
-
-    print(f"\n  Conclusion:")
-    print(f"  Increasing msg_weight from 0.0 to 0.4 reduced evolved density "
-          f"from {density_b:.2f} to {density_c:.2f}.")
-    print(f"  This confirms the message penalty is actively shaping topology "
-          f"structure.")

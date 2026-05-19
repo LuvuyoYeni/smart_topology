@@ -1,16 +1,6 @@
 """
-evolution_engine.py
--------------------
-Drives the evolutionary algorithm that searches for high-fitness
-communication topologies.
-
-Each generation:
-  1. All genomes are evaluated by the FitnessEvaluator.
-  2. The best fitness is recorded for the progress curve.
-  3. Parent pairs are selected via tournament selection.
-  4. Offspring are produced by crossover (with probability crossover_rate)
-     or direct copy, then mutated (with probability mutation_rate).
-  5. The bottom 50 % of the population is replaced by the offspring.
+evolution_engine.py — generational EA over TopologyGenome populations.
+Each generation: evaluate, record best, breed offspring, replace bottom 50%.
 """
 
 from __future__ import annotations
@@ -24,34 +14,7 @@ from fitness_evaluator import FitnessEvaluator
 
 
 class EvolutionEngine:
-    """
-    Runs a generational evolutionary algorithm over a population of
-    :class:`TopologyGenome` instances.
-
-    Attributes
-    ----------
-    population_size : int
-        Number of genomes in the population (default 20).
-    num_generations : int
-        How many generations to evolve (default 50).
-    mutation_rate : float
-        Probability that a genome is mutated after crossover (default 0.1).
-    crossover_rate : float
-        Probability that two parents produce a crossover child rather than
-        a copy of the fitter parent (default 0.7).
-    selection_method : str
-        Parent-selection strategy; currently only ``"tournament"`` is
-        supported (default ``"tournament"``).
-    num_agents : int
-        Number of agents each genome covers (default 6).
-    population : list[TopologyGenome]
-        The current generation of candidate topologies.
-    fitness_evaluator : FitnessEvaluator
-        Scores each genome during evaluation.
-    best_per_generation : list[float]
-        Best fitness recorded at the end of each generation; populated by
-        :meth:`run`.
-    """
+    """Generational EA over TopologyGenome populations using tournament selection."""
 
     def __init__(
         self,
@@ -65,26 +28,6 @@ class EvolutionEngine:
         generation_callback=None,
         complete_callback=None,
     ):
-        """
-        Parameters
-        ----------
-        population_size : int
-            Genomes per generation.
-        num_generations : int
-            Total generations to run.
-        mutation_rate : float
-            Per-genome mutation probability in [0, 1].
-        crossover_rate : float
-            Probability of crossover vs. copying the fitter parent.
-        selection_method : str
-            Selection strategy (``"tournament"`` only for now).
-        num_agents : int
-            Dimension of each adjacency matrix.
-        generation_callback : callable or None
-            Optional ``fn(gen_num, best_fitness)`` called after each generation.
-        complete_callback : callable or None
-            Optional ``fn(best_genome)`` called when the run finishes.
-        """
         self.generation_callback = generation_callback
         self.complete_callback = complete_callback
         self.population_size: int = population_size
@@ -103,23 +46,7 @@ class EvolutionEngine:
         self._stagnation_counter: int = 0
         self._stagnation_limit: int = 8  # inject fresh genomes after 8 stale generations
 
-    # ------------------------------------------------------------------ #
-    #  Public entry point                                                  #
-    # ------------------------------------------------------------------ #
-
     def run(self) -> TopologyGenome:
-        """
-        Execute the full evolutionary run and return the best genome found.
-
-        Initialises the population, evolves for :attr:`num_generations`
-        generations (printing the best fitness each generation), then
-        returns the genome with the highest fitness score.
-
-        Returns
-        -------
-        TopologyGenome
-            The fittest genome found across all generations.
-        """
         self._initialise_population()
 
         for generation in range(self.num_generations):
@@ -137,105 +64,56 @@ class EvolutionEngine:
             self.complete_callback(best_genome)
         return best_genome
 
-    # ------------------------------------------------------------------ #
-    #  Initialisation                                                      #
-    # ------------------------------------------------------------------ #
-
     def _initialise_population(self) -> None:
-        """
-        Fill :attr:`population` with random genomes.
-
-        Each genome's adjacency matrix is built with an independent
-        edge-existence probability of 0.3.
-        """
         self.population = [
             TopologyGenome.random(num_agents=self.num_agents, edge_probability=0.3)
             for _ in range(self.population_size)
         ]
 
-    # ------------------------------------------------------------------ #
-    #  Evaluation                                                          #
-    # ------------------------------------------------------------------ #
-
     def _evaluate_population(self) -> None:
-        """
-        Score every genome in :attr:`population`.
-
-        Calls :meth:`FitnessEvaluator.evaluate` on each genome, which
-        writes the score back to ``genome.fitness_score`` in place.
-        """
         for genome in self.population:
             self.fitness_evaluator.evaluate(genome)
 
-    # ------------------------------------------------------------------ #
-    #  Selection                                                           #
-    # ------------------------------------------------------------------ #
-
     def _select_parents(self) -> tuple[TopologyGenome, TopologyGenome]:
-        """
-        Choose two parents via tournament selection.
-
-        Each parent is selected independently: three genomes are sampled
-        at random (with replacement) from the current population and the
-        one with the highest fitness score is kept.
-
-        Returns
-        -------
-        tuple[TopologyGenome, TopologyGenome]
-            A pair of parent genomes.
-        """
-        def tournament() -> TopologyGenome:
+        def tournament():
             contestants = random.choices(self.population, k=3)
             return max(contestants, key=lambda g: g.fitness_score)
-
         return tournament(), tournament()
-
-    # ------------------------------------------------------------------ #
-    #  Generation step                                                     #
-    # ------------------------------------------------------------------ #
 
     def _evolve_generation(self) -> None:
         """
         Advance the population by one generation.
 
-        Steps
-        -----
-        1. Evaluate all genomes.
-        2. Record the best fitness for this generation.
-        3. Produce offspring to replace the bottom 50 % of the population:
-           a. Select two parents via tournament.
-           b. With probability ``crossover_rate``, produce a crossover child;
-              otherwise copy the fitter parent.
-           c. Apply mutation to the offspring with probability
-              ``mutation_rate``.
-        4. Sort the population by fitness (descending) and replace the
-           bottom half with the new offspring.
+        1. Snapshot the current elite (elitism: its score survives stochastic
+           re-evaluation).
+        2. Evaluate all genomes; restore elite's score.
+        3. Breed num_offspring = population_size // 2 children via tournament
+           selection + crossover (or fitter-parent copy) + mutation.
+        4. Sort descending by fitness; replace bottom half with offspring.
+        5. Inject fresh random genomes into the bottom half after
+           _stagnation_limit consecutive non-improving generations.
         """
-        # ELITISM: snapshot the current best and its stable score
+        # ELITISM: snapshot before evaluation overwrites the score
         elite = max(self.population, key=lambda g: g.fitness_score)
         elite_score = elite.fitness_score  # preserve — evaluate() will overwrite it
 
         self._evaluate_population()
 
-        # Restore the elite's score so it isn't re-randomised by stochastic eval
+        # Restore so the elite isn't penalised by a bad stochastic re-evaluation
         elite.fitness_score = elite_score
 
-        # Record best fitness (may be elite or a newly improved genome)
         best_fitness = max(g.fitness_score for g in self.population)
         self.best_per_generation.append(best_fitness)
 
-        # How many offspring to breed (replace bottom 50 %)
         num_offspring = self.population_size // 2
-        offspring: list[TopologyGenome] = []
+        offspring = []
 
         for _ in range(num_offspring):
             parent_a, parent_b = self._select_parents()
 
-            # Crossover or copy
             if random.random() < self.crossover_rate:
                 child = parent_a.crossover(parent_b)
             else:
-                # Copy the fitter parent
                 fitter = (parent_a
                           if parent_a.fitness_score >= parent_b.fitness_score
                           else parent_b)
@@ -244,20 +122,13 @@ class EvolutionEngine:
                     adjacency_matrix=fitter.adjacency_matrix.copy(),
                 )
 
-            # Mutation
             child.mutate(self.mutation_rate)
             offspring.append(child)
 
-        # Sort descending by fitness; replace the bottom half with offspring
         self.population.sort(key=lambda g: g.fitness_score, reverse=True)
         self.population[num_offspring:] = offspring
 
-        # ELITISM: guarantee the elite genome survives by replacing the worst
-        worst_idx = min(range(len(self.population)),
-                        key=lambda i: self.population[i].fitness_score)
-        self.population[worst_idx] = elite
-
-        # DIVERSITY INJECTION: if stuck, replace bottom 50% with fresh genomes
+        # DIVERSITY INJECTION: break out of local optima after stagnation
         current_best = max(g.fitness_score for g in self.population)
         if len(self.best_per_generation) > 1:
             previous_best = self.best_per_generation[-2]
@@ -275,17 +146,7 @@ class EvolutionEngine:
                 )
             self._stagnation_counter = 0
 
-    # ------------------------------------------------------------------ #
-    #  Visualisation                                                       #
-    # ------------------------------------------------------------------ #
-
     def _plot_progress(self) -> None:
-        """
-        Display a line chart of best fitness per generation.
-
-        X-axis: generation number (1-indexed).
-        Y-axis: best fitness score recorded that generation.
-        """
         if not self.best_per_generation:
             print("No data to plot — call run() first.")
             return

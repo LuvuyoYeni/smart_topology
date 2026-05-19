@@ -262,6 +262,7 @@ def _spawn_agents(num_agents: int, grid_size: int, mode: str) -> list:
 if __name__ == "__main__":
     import random
     from evolution_engine import EvolutionEngine
+    from strategic_evolution_fix import ConnectivityEnforcedEvaluator
 
     np.random.seed(1)
     random.seed(1)
@@ -274,6 +275,9 @@ if __name__ == "__main__":
 
     print("Evolving strategic topology (50 generations)...")
     engine_strat = EvolutionEngine(agent_mode="strategic")
+    engine_strat.fitness_evaluator = ConnectivityEnforcedEvaluator(
+        num_trials=5, agent_mode="strategic"
+    )
     genome_strat = engine_strat.run()
     print(f"  Result: {genome_strat}\n")
 
